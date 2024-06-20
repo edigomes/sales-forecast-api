@@ -1,42 +1,44 @@
 from flask import Flask, request, jsonify
 import pandas as pd
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from statsmodels.tsa.arima.model import ARIMA
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-def make_predictions(data, periods, granularidade, start_date):
+def make_predictions(data, periods, granularidade, start_date, apply_growth_curve, adjustment_factor):
     df = pd.DataFrame(data)
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     df.set_index('timestamp', inplace=True)
 
-
-    freq_map = {'D': 'D', 'S': 'W-MON', 'M': 'ME'}
-    freq_number = {'D': 30, 'S': 7, 'M': 12}
+    freq_map = {'D': 'D', 'S': 'W-MON', 'M': 'M'}
     df_sales = pd.json_normalize(data)
     df_sales['timestamp'] = pd.to_datetime(df_sales['timestamp'])
-    df_sales_grouped = df_sales.groupby(['item_id', pd.Grouper(key='timestamp', freq=freq_map[granularidade])])[
-        'demand'].sum().reset_index()
+    df_sales_grouped = df_sales.groupby(['item_id', pd.Grouper(key='timestamp', freq=freq_map[granularidade])])['demand'].sum().reset_index()
 
     df_previsoes = pd.DataFrame(columns=['mercadoria_id', 'dPrevisao', 'periodo', 'qTotal'])
 
     for produto in df_sales_grouped['item_id'].unique():
         df_produto = df_sales_grouped[df_sales_grouped['item_id'] == produto]
-
-        if len(data) < 6:
-            model = ARIMA(df_produto['demand'], order=(1, 1, 1))
-            model_fit = model.fit()
-        else:
-            model = SARIMAX(df_produto['demand'], order=(1, 1, 1), seasonal_order=(1, 1, 1, freq_number[granularidade]))
-            model_fit = model.fit(disp=0)
+        df_produto.set_index('timestamp', inplace=True)
 
         date_range = pd.date_range(start=start_date, periods=periods, freq=freq_map[granularidade])
-
-        forecast = model_fit.forecast(steps=periods)
-        for date, vendas in zip(date_range, forecast):
+        
+        for i, date in enumerate(date_range):
             formatted_date = date.strftime("%Y-%m-%d")
-            df_previsoes.loc[len(df_previsoes)] = [produto, formatted_date, granularidade, round(vendas)]
+            year_ago_value = df_produto[df_produto.index == (date - pd.DateOffset(years=1))]['demand'].values
+            if len(year_ago_value) > 0:
+                vendas = year_ago_value[0]
+            else:
+                vendas = df_produto['demand'].mean()  # Média dos meses anteriores se não houver dados do ano passado
+            
+            if apply_growth_curve:
+                growth_factor = 1 + 0.1 * (i / periods) if i < periods / 2 else 1 - 0.1 * ((i - periods / 2) / periods)
+                vendas = vendas * growth_factor
+            
+            if adjustment_factor is not None:
+                vendas = vendas * (1 + adjustment_factor / 100)
+            
+            df_previsoes.loc[len(df_previsoes)] = [produto, formatted_date, granularidade, max(0, round(vendas))]
+
     return jsonify(df_previsoes.to_dict(orient='records'))
 
 @app.route('/forecast', methods=['POST'])
@@ -47,12 +49,14 @@ def predict():
     data_inicio = data["data_inicio"]
     periodos = data["periodos"]
     sales_data = data["sales_data"]
+    apply_growth_curve = data.get("apply_growth_curve", False)
+    adjustment_factor = data.get("adjustment_factor", None)
 
     start_date = pd.to_datetime(data_inicio)
     if granularidade == 'S':
         start_date = start_date - timedelta(days=start_date.weekday())
 
-    predictions = make_predictions(sales_data, periodos, granularidade, start_date)
+    predictions = make_predictions(sales_data, periodos, granularidade, start_date, apply_growth_curve, adjustment_factor)
 
     return predictions
 
